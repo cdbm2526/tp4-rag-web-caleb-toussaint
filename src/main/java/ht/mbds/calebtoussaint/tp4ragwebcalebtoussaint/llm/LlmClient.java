@@ -3,20 +3,29 @@ package ht.mbds.calebtoussaint.tp4ragwebcalebtoussaint.llm;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatModel;
-import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
+import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.RetrievalAugmentor;
+import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
+import dev.langchain4j.rag.query.router.QueryRouter;
+import dev.langchain4j.rag.query.transformer.CompressingQueryTransformer;
 import dev.langchain4j.service.AiServices;
 import jakarta.enterprise.context.Dependent;
+import jakarta.inject.Inject;
 
 import java.io.Serializable;
 
 /**
- * Classe "métier" qui gère l'interface avec l'API du LLM (Gemini), via LangChain4j.
+ * Classe "métier" qui gère l'interface avec l'API du LLM (Gemini), via LangChain4j,
+ * avec RAG : routage entre 2 documents PDF et transformation de la question
+ * pour tenir compte de l'historique de la conversation.
  * Portée CDI "Dependent" : une instance de cette classe est créée et détruite en même temps
  * que le backing bean (Bb) dans lequel elle est injectée.
  */
 @Dependent
 public class LlmClient implements Serializable {
+
+    @Inject
+    private RagResources ragResources;
 
     /** Le rôle système choisi par l'utilisateur. */
     private String systemRole;
@@ -28,21 +37,37 @@ public class LlmClient implements Serializable {
     private ChatMemory chatMemory;
 
     /**
-     * Récupère la clé secrète et crée le modèle et l'assistant IA.
+     * Constructeur par defaut requis par CDI. L'initialisation reelle se fait
+     * dans init(), une fois que RagResources a ete injecte.
      */
     public LlmClient() {
-        String cle = System.getenv("GEMINI_KEY");
+    }
 
-        ChatModel model = GoogleAiGeminiChatModel.builder()
-                .apiKey(cle)
-                .modelName("gemini-2.5-flash")
-                .temperature(0.7)
+    /**
+     * Cree l'assistant IA, avec routage entre les 2 documents et transformation
+     * de la question. Appelee au premier usage (les champs injectes ne sont
+     * disponibles qu'apres la construction de l'objet par CDI).
+     */
+    private void initAssistantSiNecessaire() {
+        if (this.assistant != null) {
+            return;
+        }
+
+        QueryRouter queryRouter = LanguageModelQueryRouter.builder()
+                .chatModel(ragResources.getChatModel())
+                .retrieverToDescription(ragResources.getDescriptions())
+                .build();
+
+        RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
+                .queryTransformer(new CompressingQueryTransformer(ragResources.getChatModel()))
+                .queryRouter(queryRouter)
                 .build();
 
         this.chatMemory = MessageWindowChatMemory.withMaxMessages(20);
         this.assistant = AiServices.builder(Assistant.class)
-                .chatModel(model)
+                .chatModel(ragResources.getChatModel())
                 .chatMemory(chatMemory)
+                .retrievalAugmentor(retrievalAugmentor)
                 .build();
     }
 
@@ -51,6 +76,7 @@ public class LlmClient implements Serializable {
      * A appeler une seule fois, au tout début de la conversation.
      */
     public void setSystemRole(String systemRole) {
+        initAssistantSiNecessaire();
         this.systemRole = systemRole;
         this.chatMemory.add(SystemMessage.from(systemRole));
     }
@@ -59,6 +85,7 @@ public class LlmClient implements Serializable {
      * Envoie une question au LLM et retourne sa réponse.
      */
     public String envoyer(String question) {
+        initAssistantSiNecessaire();
         return this.assistant.chat(question);
     }
 }
